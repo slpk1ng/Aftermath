@@ -1,0 +1,90 @@
+{
+  "cpu_threshold": {
+    "description": "CPU 占用率阈值",
+    "hint": "（百分比，0-100）当 CPU 占用超过此值时，开始检查屏幕变化并准备记录",
+    "type": "float",
+    "default": 50.0
+  },
+  "enable_gpu": {
+    "description": "是否监控 GPU",
+    "hint": "启用后插件会自动检测显卡品牌并加载对应的监控库",
+    "type": "bool",
+    "default": true
+  },
+  "gpu_threshold": {
+    "description": "GPU 占用率阈值",
+    "hint": "（百分比，0-100）仅在启用 GPU 监控时生效，超过此值视为高负载",
+    "type": "float",
+    "default": 50.0,
+    "condition": { "enable_gpu": true }
+  },
+  "screen_change_threshold": {
+    "description": "屏幕变化检测阈值",
+    "hint": "（0-100，像素差异百分比）仅当屏幕像素差异超过此比例时，才会认为发生了明显变化，避免因细微抖动触发误报",
+    "type": "float",
+    "default": 5.0
+  },
+  "cooldown": {
+    "description": "冷却时间（秒）",
+    "hint": "一次事件结束后，需等待此时间才能再次触发新事件，避免轰炸",
+    "type": "float",
+    "default": 300.0
+  },
+  "check_interval": {
+    "description": "资源检查间隔（秒）",
+    "hint": "后台轮询 CPU/GPU 占用率的时间间隔，值越小响应越及时但更耗性能",
+    "type": "float",
+    "default": 2.0
+  },
+  "screenshot_interval": {
+    "description": "事件期间截图间隔（秒）",
+    "hint": "在记录事件期间，每间隔此时间自动截取一张屏幕快照",
+    "type": "float",
+    "default": 5.0
+  },
+  "target_umo": {
+    "description": "目标会话 UMO",
+    "hint": "需在bot通过 /get_umo 指令获取，或查看日志中的会话标识（如 aiocqhttp:GroupMessage:123456789），用于主动发送消息；留空则不会发送任何消息",
+    "type": "string",
+    "default": ""
+  },
+  "persona": {
+    "description": "发送消息时使用的人设",
+    "hint": "在 WebUI 中选择已配置的人格，留空则使用插件默认描述",
+    "type": "string",
+    "default": "",
+    "_special": "select_persona"
+  },
+  "prompt_template": {
+    "description": "LLM 提示词模板（多模态）",
+    "hint": "发送给模型的提示词，可包含 {persona} 占位符，将替换为你选择的人设。推荐描述“是什么活动”和“希望语气”等。",
+    "type": "text",
+    "default": "请仔细观察这些连续截图。这通常是用户玩游戏（如射击游戏等）、进行高强度创作或运行大型软件时的画面。请基于画面内容，详细描述发生的动作和结果（例如：击杀了敌人、完成了操作、进度条走完等）。请用符合以下人设的语气说出来。\n【人设】{persona}"
+  },
+  "provider_id": {
+    "description": "使用的 LLM Provider ID",
+    "hint": "点击右侧按钮选择已配置的模型提供商；留空则使用全局默认聊天模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "send_images": {
+    "description": "是否将截图随消息一起发送",
+    "hint": "关闭后仅发送文字描述，不附送图片",
+    "type": "bool",
+    "default": true
+  },
+  "max_images": {
+    "description": "最多发送的截图数量（按时间顺序）",
+    "hint": "事件期间若截图过多，会均匀选取此数量的图片发送",
+    "type": "int",
+    "default": 3,
+    "condition": { "send_images": true }
+  },
+  "storage_dir": {
+    "description": "截图保存目录（留空则使用插件数据目录）",
+    "hint": "若填写，请使用绝对路径，如 D:/aftermath/astrbot/screenshots",
+    "type": "string",
+    "default": ""
+  }
+}
