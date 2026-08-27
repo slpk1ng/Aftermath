@@ -108,6 +108,8 @@ class ScreenMonitorPlugin(Star):
         self.gpu_manager = GPUManager()
         self.monitor_task = asyncio.create_task(self._monitor_loop())
         self._pending_start_time = None
+        self._potential_event_detected = False
+        self._manual_recording = False
         self.is_ollama = self.config.get("llm_backend", "openai").lower() == "ollama"
 
     async def terminate(self):
@@ -122,7 +124,7 @@ class ScreenMonitorPlugin(Star):
         try:
             while True:
                 try:
-                    process_name = self.config.get("process_name", "")
+                    # 读取配置：进程列表（兼容字符串或列表）
                     process_names_config = self.config.get("process_name", [])
                     if isinstance(process_names_config, str):
                         process_names_config = [process_names_config]
@@ -132,7 +134,10 @@ class ScreenMonitorPlugin(Star):
                     gpu_percent = 0.0
                     high_load = False
 
+                    # ========== 确定当前是否使用“进程模式” ==========
+                    use_process_mode = False
                     if process_names_config:
+                        # 检查指定的进程是否在运行
                         for proc in psutil.process_iter(['name']):
                             try:
                                 proc_name = proc.info['name']
@@ -141,92 +146,171 @@ class ScreenMonitorPlugin(Star):
                                     break
                             except (psutil.NoSuchProcess, psutil.AccessDenied):
                                 continue
+
+                        # 如果配置了进程但进程未运行，且启用了回退，则切换到 CPU/GPU 模式
+                        fallback_enabled = self.config.get("enable_process_fallback", True)
+                        if not is_process_running and fallback_enabled:
+                            use_process_mode = False
+                        else:
+                            use_process_mode = True
                     else:
+                        # 未配置进程，直接使用 CPU/GPU 模式
+                        use_process_mode = False
+
+                    # ========== 如果是 CPU/GPU 模式，计算负载 ==========
+                    if not use_process_mode:
                         cpu_percent = psutil.cpu_percent(interval=None)
                         gpu_percent = self.gpu_manager.get_gpu_utilization() if self.config.get("enable_gpu", False) else 0.0
+
+                        # 解析 CPU 阈值区间
                         cpu_min, cpu_max = self._parse_range(
-                            self.config.get("cpu_threshold", "50-70"), 
-                            default_min=50, 
+                            self.config.get("cpu_threshold", "50-70"),
+                            default_min=50,
                             default_max=70
                         )
-                        high_load = cpu_min <= cpu_percent <= cpu_max
 
-                        if self.config.get("enable_gpu", False) and gpu_percent is not None:
-                            gpu_min, gpu_max = self._parse_range(
-                                self.config.get("gpu_threshold", "50-70"), 
-                                default_min=50, 
-                                default_max=70
-                            )
-                            high_load = high_load or (gpu_min <= gpu_percent <= gpu_max)
+                        # 读取高负载判定模式（默认 or）
+                        load_mode = self.config.get("high_load_mode", "or").lower()
 
+                        if load_mode == "and":
+                            high_load = (cpu_min <= cpu_percent <= cpu_max)
+                            if self.config.get("enable_gpu", False) and gpu_percent is not None:
+                                gpu_min, gpu_max = self._parse_range(
+                                    self.config.get("gpu_threshold", "50-70"),
+                                    default_min=50,
+                                    default_max=70
+                                )
+                                high_load = high_load and (gpu_min <= gpu_percent <= gpu_max)
+                        else:
+                            # 默认 OR 模式：CPU 或 GPU 任一满足即触发
+                            high_load = (cpu_min <= cpu_percent <= cpu_max)
+                            if self.config.get("enable_gpu", False) and gpu_percent is not None:
+                                gpu_min, gpu_max = self._parse_range(
+                                    self.config.get("gpu_threshold", "50-70"),
+                                    default_min=50,
+                                    default_max=70
+                                )
+                                high_load = high_load or (gpu_min <= gpu_percent <= gpu_max)
+
+                    # ========== 决定是否应该开始录制 ==========
                     should_start = False
-                    if process_name:
+                    if use_process_mode:
                         should_start = is_process_running
                     else:
+                        # 高负载且屏幕有变化时，标记潜在事件
                         screen_changed = False
                         if high_load:
                             screen = self._capture_screen()
                             if screen is not None:
-                                if self._prev_screen is not None:
+                                if self._prev_screen is None:
+                                    screen_changed = True
+                                else:
                                     diff_ratio = self._image_diff_ratio(self._prev_screen, screen)
                                     if diff_ratio >= self.config.get("screen_change_threshold", 5.0):
                                         screen_changed = True
                                 self._prev_screen = screen
-                        should_start = high_load and screen_changed
+                        if high_load and screen_changed:
+                            should_start = True
 
+                    # ========== 处理录制中的状态 ==========
                     if self._is_recording:
-                        end_condition = False
-                        if process_name:
-                            if not is_process_running:
-                                if self._process_absent_since is None:
-                                    self._process_absent_since = time.time()
-                                elif time.time() - self._process_absent_since >= self.config.get("process_end_duration", 5):
-                                    end_condition = True
-                            else:
-                                self._process_absent_since = None
-                        else:
-                            if not high_load:
-                                if self._low_load_since is None:
-                                    self._low_load_since = time.time()
-                                elif time.time() - self._low_load_since >= self.config.get("low_load_duration", 10):
-                                    end_condition = True
-                            else:
-                                self._low_load_since = None
-
-                        if end_condition:
-                            await self._finish_recording()
-                            self._low_load_since = None
-                            self._process_absent_since = None
-                        else:
+                        # 手动录制：忽略自动结束条件，一直录制直到用户停止
+                        if self._manual_recording:
                             if self._screenshots:
                                 last_shot = self._screenshots[-1]
                                 if time.time() - last_shot.stat().st_mtime >= self.config.get("screenshot_interval", 5.0):
                                     self._take_screenshot()
                             else:
                                 self._take_screenshot()
+                        else:
+                            end_condition = False
+
+                            if use_process_mode:  # 使用 use_process_mode
+                                # 进程模式：检测进程是否退出
+                                if not is_process_running:
+                                    if self._process_absent_since is None:
+                                        self._process_absent_since = time.time()
+                                    elif time.time() - self._process_absent_since >= self.config.get("process_end_duration", 5):
+                                        end_condition = True
+                                else:
+                                    self._process_absent_since = None
+                            else:
+                                # CPU/GPU 模式：检测是否进入低负载区间
+                                low_cpu_min, low_cpu_max = self._parse_range(
+                                    self.config.get("low_cpu_threshold", "0-30"),
+                                    default_min=0,
+                                    default_max=30
+                                )
+                                low_cpu = low_cpu_min <= cpu_percent <= low_cpu_max
+
+                                low_gpu = True  # 默认认为GPU低负载（未启用GPU监控时忽略）
+                                if self.config.get("enable_gpu", False) and gpu_percent is not None:
+                                    low_gpu_min, low_gpu_max = self._parse_range(
+                                        self.config.get("low_gpu_threshold", "0-30"),
+                                        default_min=0,
+                                        default_max=30
+                                    )
+                                    low_gpu = low_gpu_min <= gpu_percent <= low_gpu_max
+
+                                # 低负载判定：CPU和GPU必须同时处于低区间（AND逻辑）
+                                low_load = low_cpu and low_gpu
+
+                                if low_load:
+                                    if self._low_load_since is None:
+                                        self._low_load_since = time.time()
+                                    elif time.time() - self._low_load_since >= self.config.get("low_load_duration", 15):
+                                        end_condition = True
+                                else:
+                                    self._low_load_since = None
+
+                            if end_condition:
+                                await self._finish_recording()
+                                self._low_load_since = None
+                                self._process_absent_since = None
+                            else:
+                                # 未到结束条件，继续截图
+                                if self._screenshots:
+                                    last_shot = self._screenshots[-1]
+                                    if time.time() - last_shot.stat().st_mtime >= self.config.get("screenshot_interval", 5.0):
+                                        self._take_screenshot()
+                                else:
+                                    self._take_screenshot()
+
                     else:
-                        # 非录制状态，处理启动条件
+                        # ========== 非录制状态，处理启动条件 ==========
                         now = time.time()
                         if self._pending_start_time is not None:
-                            if should_start:
+                            # 正在等待启动
+                            if high_load:  # 只要高负载持续，就继续等待，不因屏幕变化而取消
                                 if now - self._pending_start_time >= self.config.get("process_start_duration", 5):
                                     self._pending_start_time = None
                                     await self._start_recording()
                                     self._low_load_since = None
                                     self._process_absent_since = None
+                                    self._potential_event_detected = False
                             else:
+                                # 高负载消失，取消等待
                                 self._pending_start_time = None
+                                self._potential_event_detected = False
                         else:
+                            # 没有在等待
                             if should_start:
                                 if now - self._last_event_time >= self.config.get("cooldown", 300):
                                     self._pending_start_time = now
+                                    self._potential_event_detected = True
                                     wait_time = self.config.get("process_start_duration", 5)
                                     logger.info(f"检测到潜在事件，等待 {wait_time} 秒后开始记录...")
+                            else:
+                                # 条件不满足，重置标记
+                                self._potential_event_detected = False
 
+                    # 循环间隔
                     await asyncio.sleep(self.config.get("check_interval", 2.0))
+
                 except Exception as e:
                     logger.error(f"监控循环异常: {e}")
                     await asyncio.sleep(5)
+
         except asyncio.CancelledError:
             logger.info("监控任务已取消")
             raise
@@ -272,6 +356,30 @@ class ScreenMonitorPlugin(Star):
         except Exception:
             return 0.0
 
+    def _is_meaningful_image(self, img: Image.Image) -> bool:
+        """
+        检测图片是否包含有效内容，用于过滤黑屏、纯色等无意义截图。
+        返回 True 表示有内容，False 表示无意义。
+        """
+        try:
+            # 缩小图片以加快计算速度（例如缩至100x100）
+            small = img.resize((100, 100))
+            arr = np.array(small)
+
+            # 1. 黑屏检测：平均亮度极低
+            mean_brightness = arr.mean()
+            if mean_brightness < 10.0:
+                return False
+
+            # 2. 纯色/低信息量检测：像素标准差极低（说明颜色基本一致）
+            std_dev = arr.std()
+            if std_dev < 5.0:
+                return False
+
+            return True
+        except Exception:
+            return True  # 如果检测出错，不拦截，保留图片
+
     def _take_screenshot(self):
         try:
             img = self._capture_screen()
@@ -290,8 +398,14 @@ class ScreenMonitorPlugin(Star):
                     img = img.resize((new_width, new_height), Image.LANCZOS)
                     logger.info(f"截图已缩放: {img.width}x{img.height} -> {new_width}x{new_height}")
 
+            # 过滤黑屏/纯色截图（新增逻辑）
+            if self.config.get("ignore_meaningless_screenshots", True) and not self._is_meaningful_image(img):
+                logger.info("跳过无意义截图（黑屏/纯色）")
+                return
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             
+            # 强制将 quality 转换为整数，并处理异常
             try:
                 quality = int(self.config.get("screenshot_quality", 85))
             except (ValueError, TypeError):
@@ -302,7 +416,6 @@ class ScreenMonitorPlugin(Star):
                 path = self._storage_dir / f"event_{timestamp}.jpg"
                 img.save(path, "JPEG", quality=quality)
             else:
-                # 若设置为 100 或 0，则保存为无损 PNG
                 path = self._storage_dir / f"event_{timestamp}.png"
                 img.save(path)
             self._screenshots.append(path)
@@ -329,6 +442,7 @@ class ScreenMonitorPlugin(Star):
             return
         async with self._finish_lock:
             self._is_recording = False
+            self._manual_recording = False
             self._last_event_time = time.time()
             logger.info(f"结束记录，共 {len(self._screenshots)} 张截图")
             if not self._screenshots:
@@ -484,13 +598,13 @@ class ScreenMonitorPlugin(Star):
 
         # 防止复读的核心修改：不直接回传旧句子，而是强调“只看新变化，严禁重复原话”
         if prev_desc:
-            prompt_text += "\n\n【前情摘要】上一张截图大概发生了什么（但绝对禁止复述里面的原话！只准描述当前截图最新出现的独特细节！）"
-            prompt_text += "\n【严格要求】必须一句话直击核心，不得重复！以观察者的视角，用户正在操作电脑，是你观察用户的操作，而不是想象自己在操控电脑！）"
+            prompt_text += "\n\n【前情摘要】上一张截图大概发生了什么，绝对禁止生硬地复述图片！可以用你的人设来想象你如果是ta的话，ta现在会对用户说些什么。"
+            prompt_text += "\n【严格要求】必须一句话直击核心，不得重复、生硬地描述图片的所有内容，找关键点来和用户复盘和之前的截图对比，这张新的截图有什么进展！"
         
         if focus_img is not None:
             prompt_text += f"\n\n这可能是同一事件的新截图（{focus_img.name}），请重点描述此张图片展现的进展和变化，语言必须精炼，杜绝啰嗦复读。"
 
-        # 构建图片内容（只包含传入的图片）
+        # 构建图片内容（只包含传入的图片，通常只有1张）
         content_parts = []
         images = []
         for img_path in image_paths:
@@ -536,8 +650,16 @@ class ScreenMonitorPlugin(Star):
 
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     if is_ollama:
+                        # 获取深度思考配置
+                        enable_deep_think = self.config.get("enable_deep_think", True)
                         # 添加 repeat_penalty 参数（Ollama 专属），1.3 倍能有效防止复读
-                        body = {"model": model_name, "messages": messages, "stream": False, "options": {"repeat_penalty": 1.3}}
+                        body = {
+                            "model": model_name,
+                            "messages": messages,
+                            "stream": False,
+                            "think": enable_deep_think,  # 启用深度思考
+                            "options": {"repeat_penalty": 1.3}
+                        }
                     else:
                         # OpenAI 兼容 API 使用 frequency_penalty 防止复读
                         body = {"model": model_name, "messages": messages, "frequency_penalty": 0.9}
@@ -557,6 +679,10 @@ class ScreenMonitorPlugin(Star):
                     data = resp.json()
                     if is_ollama:
                         content = data.get("message", {}).get("content", "")
+                        # 获取思考过程（如果有），仅输出到日志，不包含在最终回复中
+                        thinking = data.get("message", {}).get("thinking", "")
+                        if thinking:
+                            logger.info(f"模型思考过程: {thinking}")
                     else:
                         content = data["choices"][0]["message"]["content"]
 
@@ -593,6 +719,21 @@ class ScreenMonitorPlugin(Star):
 
 
     # ---------- 指令 ----------
+    @filter.command("am_help")
+    async def am_help(self, event: AstrMessageEvent):
+        """查看所有可用命令"""
+        help_text = (
+            "📋 **Aftermath 插件命令列表**\n\n"
+            "---\n"
+            "`/umo` — 获取当前会话的 UMO，用于配置 target_umo。\n"
+            "`/am_status` — 查看当前监控状态、启用的 GPU 类型、已记录截图数。\n"
+            "`/am_test` — 手动触发一次录制（每 5 秒截一张，共 4 张，然后发送）。\n"
+            "`/am_clear` — 清除当前会话的记忆，防止旧话题干扰。\n"
+            "`/am_start` — 手动开始持续录制，直到输入 `/am_stop` 停止。\n"
+            "`/am_stop` — 停止录制，将截图发送给 LLM 并返回消息。\n"
+        )
+        yield event.plain_result(help_text)
+
     @filter.command("am_status")
     async def am_status(self, event: AstrMessageEvent):
         """查看监控状态"""
@@ -607,11 +748,33 @@ class ScreenMonitorPlugin(Star):
 
     @filter.command("am_start")
     async def am_start(self, event: AstrMessageEvent):
-        """手动触发一次记录：每5秒截一张图，共4次，然后发送给LLM"""
-        asyncio.create_task(self.am_test())
+        """手动开始持续录制，直到 /am_stop 停止"""
+        if self._is_recording:
+            yield event.plain_result("已经在录制中，无需重复启动。")
+            return
+        self._manual_recording = True
+        self._is_recording = True
+        self._screenshots = []
+        self._take_screenshot()
+        yield event.plain_result("手动录制已开始，将按截图间隔持续截图，直到发送 /am_stop 停止。")
+
+    @filter.command("am_stop")
+    async def am_stop(self, event: AstrMessageEvent):
+        """手动停止录制并发送消息"""
+        if not self._is_recording:
+            yield event.plain_result("当前没有录制任务。")
+            return
+        self._manual_recording = False
+        await self._finish_recording()  # 该方法会发送消息并清空截图列表
+        yield event.plain_result("手动录制已停止，事件描述已发送。")
+
+    @filter.command("am_test")
+    async def am_test_cmd(self, event: AstrMessageEvent):
+        """手动触发一次录制：每5秒截一张图，共4次，然后发送给LLM"""
+        asyncio.create_task(self._run_am_test())
         yield event.plain_result("已开始手动录制：每5秒截一张图，共4次，完成后发送。")
 
-    async def am_test(self):
+    async def _run_am_test(self):
         self._is_recording = True
         self._screenshots = []
         for _ in range(4):

@@ -5,6 +5,12 @@
     "type": "string",
     "default": "50~100"
   },
+  "low_cpu_threshold": {
+    "description": "低负载CPU区间阈值",
+    "hint": "当CPU占用率落入此区间且持续一段时间后，才会结束录制。默认0-20。",
+    "type": "string",
+    "default": "0-20"
+  },
   "enable_gpu": {
     "description": "是否监控 GPU",
     "hint": "启用后插件会自动检测显卡品牌并加载对应的监控库",
@@ -16,6 +22,21 @@
     "hint": "只有落在区间内才视为高负载",
     "type": "string",
     "default": "50~100",
+    "condition": { "enable_gpu": true }
+  },
+  "low_gpu_threshold": {
+    "description": "低负载GPU区间阈值",
+    "hint": "当GPU占用率落入此区间且持续一段时间后，才会结束录制。默认0-20。",
+    "type": "string",
+    "default": "0-20",
+    "condition": { "enable_gpu": true }
+  },
+  "high_load_mode": {
+    "description": "高负载判定模式",
+    "hint": "or 表示 CPU 或 GPU 任一达到阈值即触发；and 表示两者都达到阈值才触发。",
+    "type": "string",
+    "default": "or",
+    "options": ["or", "and"],
     "condition": { "enable_gpu": true }
   },
   "screen_change_threshold": {
@@ -47,6 +68,12 @@
     "hint": "填写进程名称（如 cs2.exe、Photoshop.exe ）。填了之后将只监控这些进程的启停，完全忽略CPU/GPU阈值。留空则使用CPU/GPU监控。可在点击“添加”增加多个进程。",
     "type": "list",
     "default": []
+  },
+  "enable_process_fallback": {
+    "description": "进程未检测到时回退到CPU/GPU监控",
+    "hint": "开启后，即使配置了监控进程但当前没有任一进程在运行，插件也会自动使用CPU/GPU阈值来检测，防止漏掉未添加的进程。",
+    "type": "bool",
+    "default": true
   },
   "low_load_duration": {
     "description": "低负载持续时间（秒）",
@@ -108,7 +135,7 @@
   },
   "model_name": {
     "description": "【必填】使用的模型名称",
-    "hint": "填写模型服务中存在的模型名，例如 qwen3vl:latest ",
+    "hint": "填写模型服务中存在的模型名，例如 本地： qwen3vl:latest ; 云端： deepseek-v4-flash-vision-exp 等 ",
     "type": "string",
     "default": ""
   },
@@ -117,6 +144,13 @@
     "hint": "当后端选择 ollama 时使用",
     "type": "string",
     "default": "http://127.0.0.1:11434",
+    "condition": { "llm_backend": "ollama" }
+  },
+  "enable_deep_think": {
+    "description": "启用本地 LLM 深度思考",
+    "hint": "开启后，模型在生成回复前会先进行推理（需要模型支持，如 Qwen3、DeepSeek-R1 等），若出现状态码 400, 错误信息: does not support thinking 的报错则表示模型不支持深度思考，请关闭。",
+    "type": "bool",
+    "default": true,
     "condition": { "llm_backend": "ollama" }
   },
   "screenshot_quality": {
@@ -132,9 +166,9 @@
     "default": "原始",
     "options": ["原始", "4K", "2K", "1080p", "720p", "480p"]
   },
-  "per_image_description": {
-    "description": "是否对每张图片单独生成描述",
-    "hint": "开启后每张图片都会单独向 LLM 请求描述并按顺序发送(云会增加API计费；本地会增加性能占用持续时间)；关闭则所有图片一起发送并只生成一段综合描述（只识别一张图片，bot 情绪变化少）",
+  "ignore_meaningless_screenshots": {
+    "description": "过滤无意义截图（黑屏、纯色）",
+    "hint": "开启后，插件将自动跳过游戏过场动画中的黑屏或纯色画面，只保存有实际内容的截图",
     "type": "bool",
     "default": true
   },
@@ -152,7 +186,7 @@
   },
   "send_each_image_separately": {
     "description": "是否每张图片单独生成描述并立即发送",
-    "hint": "开启后，每张截图识别完描述后马上发送，适合实时反馈；关闭则所有图片合并后一次性发送",
+    "hint": "开启后每张图片都会单独向 LLM 请求描述并按顺序发送(云会增加API计费；本地会增加性能占用持续时间)，每张截图识别完描述后马上发送，适合实时反馈；关闭则所有图片一起发送并只生成一段综合描述（只识别一张图片，bot 情绪变化少",
     "type": "bool",
     "default": true
   },
