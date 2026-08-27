@@ -67,7 +67,7 @@
     "default": 3
   },
   "target_umo": {
-    "description": "目标会话 UMO",
+    "description": "【必填】目标会话 UMO",
     "hint": "需在bot通过 /get_umo 指令获取，用于主动发送消息，从bot的ID名开始复制。",
     "type": "string",
     "default": ""
@@ -83,20 +83,41 @@
     "description": "LLM 提示词模板（多模态）",
     "hint": "发送给模型的提示词，可包含 {persona} 占位符，将自动替换为你选择的人设",
     "type": "text",
-    "default": "请以旁观者（观察用户）的视角仔细观察这些连续截图，用符合以下人设的语气说出来。\n【人设】{persona}"
+    "default": "请你以观察者的视角（用户正在操作电脑，你需要观察用户，而不是想象自己在操控电脑！），仔细观察这些连续截图，用符合以下人设的语气简要地说出来，不得长篇大论。\n【人设】{persona}"
   },
-  "provider_id": {
-    "description": "使用的 LLM Provider ID",
-    "hint": "点击右侧按钮选择已配置的模型提供商；留空则使用全局默认聊天模型",
+  "llm_backend": {
+    "description": "LLM 后端类型",
+    "hint": "选择 ollama 使用本地 Ollama；选择 openai 使用云端 API（需填写 api_base_url 和 api_key）",
+    "type": "string",
+    "default": "openai",
+    "options": ["openai", "ollama"]
+  },
+  "api_base_url": {
+    "description": "【必填】直连 API 地址",
+    "hint": "填写你的模型服务的基础地址，例如 https://api.deepseek.com",
     "type": "string",
     "default": "",
-    "_special": "select_provider"
+    "condition": { "llm_backend": "openai" }
+  },
+  "api_key": {
+    "description": "【必填】API 密钥",
+    "hint": "填写访问云端模型服务所需的 API Key",
+    "type": "string",
+    "default": "",
+    "condition": { "llm_backend": "openai" }
+  },
+  "model_name": {
+    "description": "【必填】使用的模型名称",
+    "hint": "填写模型服务中存在的模型名，例如 qwen3vl:latest ",
+    "type": "string",
+    "default": ""
   },
   "ollama_api_url": {
-  "description": "Ollama API 地址",
-  "hint": "仅当使用 Ollama 模型且多模态不可用时需要",
-  "type": "string",
-  "default": "http://127.0.0.1:11434"
+    "description": "【默认】Ollama API 地址",
+    "hint": "当后端选择 ollama 时使用",
+    "type": "string",
+    "default": "http://127.0.0.1:11434",
+    "condition": { "llm_backend": "ollama" }
   },
   "screenshot_quality": {
     "description": "截图画质",
@@ -117,6 +138,12 @@
     "type": "bool",
     "default": true
   },
+  "request_timeout": {
+    "description": "模型请求超时时间（秒）",
+    "hint": "本地模型处理较慢或云端波动时，可适当调大，默认 120 秒。",
+    "type": "int",
+    "default": 120
+  },
   "send_images": {
     "description": "是否将截图随消息一起发送",
     "hint": "关闭后仅发送文字描述，不附送图片",
@@ -131,7 +158,7 @@
   },
   "max_images": {
     "description": "最多发送的截图数量（按时间顺序）",
-    "hint": "事件期间若截图过多，会均匀选取此数量的图片发送。开启每张图片单独生成描述后不建议开太高，避免浪费 Token 或性能",
+    "hint": "事件期间若截图过多，会均匀选取此数量的图片发送。开启每张图片单独生成描述后不建议开太高，避免浪费 Token 或性能。如果出现状态码 400，错误信息：request (123456 tokens) 超出上限的报错，请尝试降低此值降低改截图画质/分辨率的设置。",
     "type": "int",
     "default": 3,
     "condition": { "send_images": true }

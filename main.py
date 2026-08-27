@@ -108,6 +108,7 @@ class ScreenMonitorPlugin(Star):
         self.gpu_manager = GPUManager()
         self.monitor_task = asyncio.create_task(self._monitor_loop())
         self._pending_start_time = None
+        self.is_ollama = self.config.get("llm_backend", "openai").lower() == "ollama"
 
     async def terminate(self):
         if self.monitor_task:
@@ -143,7 +144,6 @@ class ScreenMonitorPlugin(Star):
                     else:
                         cpu_percent = psutil.cpu_percent(interval=None)
                         gpu_percent = self.gpu_manager.get_gpu_utilization() if self.config.get("enable_gpu", False) else 0.0
-                        # 解析 CPU 阈值区间
                         cpu_min, cpu_max = self._parse_range(
                             self.config.get("cpu_threshold", "50-70"), 
                             default_min=50, 
@@ -206,28 +206,22 @@ class ScreenMonitorPlugin(Star):
                                 self._take_screenshot()
                     else:
                         # 非录制状态，处理启动条件
-                        if should_start:
-                            now = time.time()
-                            # 先检查冷却时间
-                            if now - self._last_event_time >= self.config.get("cooldown", 300):
-                                # 冷却时间已过，开始计算“等待开始”时间
-                                if self._pending_start_time is None:
-                                    self._pending_start_time = now
-                                    wait_time = self.config.get("process_start_duration", 5)
-                                    logger.info(f"检测到潜在事件，等待 {wait_time} 秒后开始记录...")
-                                elif now - self._pending_start_time >= self.config.get("process_start_duration", 5):
-                                    # 等待时间已到，真正开始录制
+                        now = time.time()
+                        if self._pending_start_time is not None:
+                            if should_start:
+                                if now - self._pending_start_time >= self.config.get("process_start_duration", 5):
                                     self._pending_start_time = None
                                     await self._start_recording()
                                     self._low_load_since = None
                                     self._process_absent_since = None
-                                # else: 还在等待中，继续循环
                             else:
-                                # 冷却时间未过，重置等待状态
                                 self._pending_start_time = None
                         else:
-                            # 条件不满足，重置等待状态
-                            self._pending_start_time = None
+                            if should_start:
+                                if now - self._last_event_time >= self.config.get("cooldown", 300):
+                                    self._pending_start_time = now
+                                    wait_time = self.config.get("process_start_duration", 5)
+                                    logger.info(f"检测到潜在事件，等待 {wait_time} 秒后开始记录...")
 
                     await asyncio.sleep(self.config.get("check_interval", 2.0))
                 except Exception as e:
@@ -239,9 +233,6 @@ class ScreenMonitorPlugin(Star):
 
     @staticmethod
     def _parse_resolution(value: str) -> Optional[tuple]:
-        """
-        解析分辨率预设字符串，返回 (宽, 高) 元组；若返回 None 则表示不缩放。
-        """
         mapping = {
             "原始": None,
             "4k": (3840, 2160),
@@ -253,7 +244,6 @@ class ScreenMonitorPlugin(Star):
         key = str(value).strip().lower()
         if key in mapping:
             return mapping[key]
-        # 兼容手动输入形如 "1920x1080" 的格式
         if "x" in key:
             try:
                 w, h = key.split("x")
@@ -301,11 +291,18 @@ class ScreenMonitorPlugin(Star):
                     logger.info(f"截图已缩放: {img.width}x{img.height} -> {new_width}x{new_height}")
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            quality = self.config.get("screenshot_quality", 85)
+            
+            try:
+                quality = int(self.config.get("screenshot_quality", 85))
+            except (ValueError, TypeError):
+                quality = 85
+                logger.warning("screenshot_quality 配置无效，已回退为 85")
+
             if 0 < quality < 100:
                 path = self._storage_dir / f"event_{timestamp}.jpg"
                 img.save(path, "JPEG", quality=quality)
             else:
+                # 若设置为 100 或 0，则保存为无损 PNG
                 path = self._storage_dir / f"event_{timestamp}.png"
                 img.save(path)
             self._screenshots.append(path)
@@ -355,32 +352,31 @@ class ScreenMonitorPlugin(Star):
 
                 logger.info(f"选中的图片路径: {[str(p) for p in selected]}")
 
-                # 是否每张图片单独生成描述并立即发送，默认 True
                 send_each_image_separately = self.config.get("send_each_image_separately", True)
 
                 if send_each_image_separately:
-                    # 逐张处理并立即发送
+                    previous_description = ""  # 记录上次生成的描述
                     for img_path in selected:
                         if not img_path.exists():
                             logger.warning(f"截图文件不存在，跳过: {img_path}")
                             continue
-                        # 单张图片调用 LLM 生成描述
-                        description = await self._generate_description([img_path])
-                        
-                        # 构建这条图片对应的消息链
+                        # 只传当前图片，并传入之前的描述作为上下文
+                        description = await self._generate_description(
+                            [img_path], 
+                            focus_img=img_path, 
+                            prev_desc=previous_description
+                        )
+                        # 构建消息链并发送
                         chain = MessageChain()
                         if self.config.get("send_images", True):
                             chain.file_image(str(img_path))
                         chain.message(description)
-                        
-                        # 立即发送
                         await self.context.send_message(target_umo, chain)
                         logger.info(f"已发送图片 {img_path.name} 及其描述")
-                        
-                        # 可选：适当等待，避免发送过快
-                        # await asyncio.sleep(0.5)
+                        # 更新描述，供下张图片使用
+                        previous_description = description
                 else:
-                    # 原有逻辑：合并所有图片后一次性发送
+                    # 合并发送所有图片
                     chain = MessageChain()
                     if self.config.get("send_images", True):
                         for img_path in selected:
@@ -402,24 +398,16 @@ class ScreenMonitorPlugin(Star):
 
     @staticmethod
     def _parse_range(value, default_min: float, default_max: float) -> tuple:
-        """
-        解析区间字符串，支持逗号/空格/~/-分隔。
-        返回 (min, max)，解析失败时返回默认值。
-        """
         if value is None:
             return default_min, default_max
         if isinstance(value, (int, float)):
-            # 如果传的是单个数字，则默认区间为 [value, value]
             return float(value), float(value)
         if isinstance(value, (list, tuple)):
-            # 如果传的是列表，取前两个元素
             vals = [float(x) for x in value[:2]]
             if len(vals) == 1:
                 return vals[0], vals[0]
             return min(vals[0], vals[1]), max(vals[0], vals[1])
-        # 字符串处理
         text = str(value).strip()
-        # 支持 ~ 或 - 分隔，但注意负号可能出现在数值内（如 -10~50）
         parts = None
         for sep in ['~', '-', ',', ' ', '\t', '\n']:
             if sep in text:
@@ -433,24 +421,19 @@ class ScreenMonitorPlugin(Star):
                 return min(first, second), max(first, second)
             except ValueError:
                 pass
-        # 如果只有一个数字
         try:
             single = float(text)
             return single, single
         except ValueError:
             return default_min, default_max
 
-    async def _generate_description(self, image_paths: List[Path]) -> str:
-        provider_id = self.config.get("provider_id", "")
-        if not provider_id:
-            try:
-                provider_id = await self.context.get_current_chat_provider_id(None)
-            except Exception:
-                provider_id = ""
-        if not provider_id:
-            logger.error("无法确定 LLM Provider，请配置 provider_id 或确保 AstrBot 已配置默认 Provider")
-            return "（未能生成描述，因为未配置 LLM Provider）"
-
+    async def _generate_description(self, image_paths: List[Path], focus_img: Optional[Path] = None, prev_desc: str = "") -> str:
+        """
+        根据配置生成事件描述。
+        :param image_paths: 本次请求使用的图片列表（通常只传当前图片）
+        :param focus_img: 当前要重点描述的图片
+        :param prev_desc: 上一次生成的描述（作为上下文）
+        """
         persona_id = self.config.get("persona", "")
         persona_prompt = ""
         if persona_id:
@@ -460,103 +443,56 @@ class ScreenMonitorPlugin(Star):
                     persona_prompt = persona_obj.system_prompt
             except Exception as e:
                 logger.error(f"获取人格 {persona_id} 失败: {e}")
-                persona_prompt = ""
         if not persona_prompt:
             persona_prompt = self.config.get("persona", "你是一个观察者，用幽默的口吻描述发生的事情。")
 
-        logger.info(f"provider_id: {provider_id}, 图片数量: {len(image_paths)}")
-        logger.info(f"ImagePart is None: {ImagePart is None}")
+        return await self._generate_description_direct(image_paths, persona_prompt, focus_img, prev_desc)
 
-        # 如果 ImagePart 不可用，直接走直连 API（兼容 Ollama 和云端）
-        if ImagePart is None:
-            logger.info("使用直连 API 识图")
-            return await self._generate_description_direct(image_paths, persona_prompt)
-
-        # 以下为 ImagePart 可用时的逻辑（保留）
-        contexts = None
-        if ImagePart is not None:
-            try:
-                content = []
-                for img_path in image_paths:
-                    mime_type = "image/jpeg" if img_path.suffix.lower() in [".jpg", ".jpeg"] else "image/png"
-                    content.append(ImagePart(image=str(img_path), mime_type=mime_type))
-                    logger.info(f"ImagePart 添加成功: {img_path}")
-                prompt_template = self.config.get("prompt_template", "")
-                if not prompt_template:
-                    prompt_template = "请仔细观察这些连续截图，用符合以下人设的语气说出来。\n【人设】{persona}"
-                prompt_text = prompt_template.replace("{persona}", persona_prompt)
-                content.append(TextPart(text=prompt_text))
-                user_msg = UserMessageSegment(content=content)
-                contexts = [user_msg]
-                logger.info(f"UserMessageSegment 构建成功，内容类型: {type(content[0])}")
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                logger.warning(f"多模态构建失败，降级为纯文本: {e}")
-                contexts = None
-
-        try:
-            system_prompt = "你是一个观察者，根据上下文猜测发生了什么，并用指定人设的语气描述"
-            if contexts is not None:
-                logger.info("使用多模态上下文调用 LLM")
-                resp = await self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt="",
-                    contexts=contexts,
-                    system_prompt=system_prompt
-                )
-            else:
-                logger.warning("使用纯文本上下文调用 LLM")
-                text_prompt = (
-                    f"用户刚刚玩了游戏或制作完了一个很大的工程，屏幕发生了明显变化。"
-                    f"请根据以下描述（无图片）结合人设简要说明可能发生的情况：\n"
-                    f"【人设】{persona_prompt}"
-                )
-                resp = await self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=text_prompt,
-                    system_prompt=system_prompt
-                )
-            if resp and resp.completion_text:
-                return resp.completion_text.strip()
-            return "（未获取到描述）"
-        except Exception as e:
-            logger.error(f"LLM 调用失败: {e}")
-            return f"（描述生成失败：{e}）"
-
-    async def _generate_description_direct(self, image_paths: List[Path], persona_prompt: str) -> str:
+    async def _generate_description_direct(self, image_paths: List[Path], persona_prompt: str, focus_img: Optional[Path] = None, prev_desc: str = "") -> str:
         import base64
         import httpx
 
-        provider_id = self.config.get("provider_id", "")
-        api_base = self.config.get("ollama_api_url", "").rstrip("/")
-        api_key = self.config.get("api_key", "")
+        llm_backend = self.config.get("llm_backend", "openai").lower()
+        is_ollama = (llm_backend == "ollama")
+        
+        # 读取超时时间配置（默认120秒）
+        timeout = self.config.get("request_timeout", 120)
 
-        # 尝试从 Provider 管理器获取配置
-        try:
-            provider_manager = self.context.provider_manager
-            providers = provider_manager.get_providers() if hasattr(provider_manager, 'get_providers') else []
-            for p in providers:
-                if p.id == provider_id:
-                    api_base = getattr(p, 'api_base', getattr(p, 'base_url', api_base))
-                    api_key = getattr(p, 'api_key', api_key)
-                    break
-        except Exception as e:
-            logger.warning(f"获取 Provider 配置失败: {e}")
+        if is_ollama:
+            api_base = self.config.get("ollama_api_url", "http://127.0.0.1:11434").rstrip("/")
+            api_key = ""
+            model_name = self.config.get("model_name", "").strip()
+            if not model_name:
+                logger.error("未指定 Ollama 模型名称，请在插件配置中添加 model_name")
+                return "（Ollama 模型名称未配置）"
+        else:
+            api_base = self.config.get("api_base_url", "").strip()
+            api_key = self.config.get("api_key", "").strip()
+            model_name = self.config.get("model_name", "").strip()
+            if not api_base:
+                logger.error("未配置 API 地址（api_base_url），请在插件配置中添加")
+                return "（API 地址未配置）"
+            if not model_name:
+                logger.error("未配置模型名称（model_name），请在插件配置中添加")
+                return "（模型名称未配置）"
 
-        # 判断是否为 Ollama 本地
-        is_ollama = "ollama" in provider_id.lower() or "127.0.0.1" in api_base or "localhost" in api_base
-
-        model_name = provider_id.replace("ollama/", "")
-
+        # 构建基础提示词
         prompt_template = self.config.get("prompt_template", "")
         if not prompt_template:
-            prompt_template = "请仔细观察这些连续截图，用符合以下人设的语气说出来。\n【人设】{persona}"
+            prompt_template = "请你以观察者的视角（用户正在操作电脑，你需要观察用户，而不是想象自己在操控电脑！），仔细观察这些连续截图，用符合以下人设的语气简要地说出来，不得长篇大论。\n【人设】{persona}"
         prompt_text = prompt_template.replace("{persona}", persona_prompt)
 
-        # 构建内容
+        # 防止复读的核心修改：不直接回传旧句子，而是强调“只看新变化，严禁重复原话”
+        if prev_desc:
+            prompt_text += "\n\n【前情摘要】上一张截图大概发生了什么（但绝对禁止复述里面的原话！只准描述当前截图最新出现的独特细节！）"
+            prompt_text += "\n【严格要求】必须一句话直击核心，不得重复！以观察者的视角，用户正在操作电脑，是你观察用户的操作，而不是想象自己在操控电脑！）"
+        
+        if focus_img is not None:
+            prompt_text += f"\n\n这可能是同一事件的新截图（{focus_img.name}），请重点描述此张图片展现的进展和变化，语言必须精炼，杜绝啰嗦复读。"
+
+        # 构建图片内容（只包含传入的图片）
         content_parts = []
-        images = []  # 用于 Ollama 格式
+        images = []
         for img_path in image_paths:
             try:
                 img_bytes = img_path.read_bytes()
@@ -564,49 +500,59 @@ class ScreenMonitorPlugin(Star):
                 if is_ollama:
                     images.append(b64)
                 else:
-                    data_uri = f"data:image/png;base64,{b64}"
+                    mime = "image/jpeg" if img_path.suffix.lower() in [".jpg", ".jpeg"] else "image/png"
+                    data_uri = f"data:{mime};base64,{b64}"
                     content_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
-                logger.info(f"已编码图片: {img_path}")
             except Exception as e:
                 logger.error(f"图片编码失败 {img_path}: {e}")
 
         if is_ollama:
-            content_parts.append({"type": "text", "text": prompt_text})
             messages = [{"role": "user", "content": prompt_text, "images": images}]
         else:
             content_parts.append({"type": "text", "text": prompt_text})
             messages = [{"role": "user", "content": content_parts}]
 
-        logger.info(f"请求模型: {model_name}, 消息结构: {messages}")  # 注意：此日志可能泄露 base64，建议注释掉
+        # 构造 endpoint
+        if is_ollama:
+            endpoint = api_base.rstrip("/") + "/api/chat"
+            headers = {}
+        else:
+            api_base_clean = api_base.rstrip("/")
+            if not api_base_clean.endswith("/v1"):
+                endpoint = api_base_clean + "/v1/chat/completions"
+            else:
+                endpoint = api_base_clean + "/chat/completions"
+            headers = {}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
 
-        max_retries = 3  # 最大重试次数
+        max_retries = 5
+        last_error = ""
+
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=120) as client:
+                logger.info(f"请求地址: {endpoint}")
+                logger.info(f"请求模型: {model_name}")
+
+                async with httpx.AsyncClient(timeout=timeout) as client:
                     if is_ollama:
-                        endpoint = f"{api_base}/api/chat" if not api_base.endswith("/api/chat") else api_base
-                        headers = {}
-                        body = {"model": model_name, "messages": messages, "stream": False}
+                        # 添加 repeat_penalty 参数（Ollama 专属），1.3 倍能有效防止复读
+                        body = {"model": model_name, "messages": messages, "stream": False, "options": {"repeat_penalty": 1.3}}
                     else:
-                        if not api_base.endswith("/v1"):
-                            api_base += "/v1"
-                        endpoint = f"{api_base}/chat/completions"
-                        headers = {"Authorization": f"Bearer {api_key}"}
-                        body = {"model": model_name, "messages": messages}
+                        # OpenAI 兼容 API 使用 frequency_penalty 防止复读
+                        body = {"model": model_name, "messages": messages, "frequency_penalty": 0.9}
 
                     resp = await client.post(endpoint, json=body, headers=headers)
-                    # 记录状态码和响应体（截断，防止日志过长）
-                    logger.debug(f"API 状态码: {resp.status_code}, 响应内容前200字符: {resp.text[:200]}")
 
                     if resp.status_code != 200:
                         error_msg = resp.text if resp.text else "响应体为空"
                         logger.warning(f"第 {attempt+1} 次请求失败: 状态码 {resp.status_code}, 错误信息: {error_msg[:200]}")
-                        # 非 200 视为失败，重试
+                        last_error = f"{resp.status_code} - {error_msg[:200]}"
                         if attempt < max_retries - 1:
                             await asyncio.sleep(2)
                             continue
                         else:
-                            return f"（API错误：{resp.status_code} - {error_msg[:200]}）"
+                            return f"（API错误：{last_error}）"
 
                     data = resp.json()
                     if is_ollama:
@@ -618,29 +564,31 @@ class ScreenMonitorPlugin(Star):
                     return content.strip() if content else "（未获取到描述）"
 
             except httpx.TimeoutException as e:
-                logger.warning(f"第 {attempt+1} 次请求超时: {e}")
+                logger.warning(f"第 {attempt+1} 次请求超时: {e}。超时时间设置为 {timeout} 秒，若仍超时请在配置中调大 request_timeout")
+                last_error = f"timeout: {e}"
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
                     continue
                 else:
-                    return "（直连 API 超时，请检查 Ollama 是否响应）"
+                    return f"（直连 API 超时，请检查服务是否响应或调大 request_timeout）"
             except httpx.HTTPStatusError as e:
                 response_text = e.response.text if e.response else "无响应"
                 logger.warning(f"第 {attempt+1} 次请求 HTTP 错误: {e}, 响应内容: {response_text[:200]}")
+                last_error = f"{e} - {response_text[:200]}"
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
                     continue
                 else:
-                    return f"（直连 API HTTP 错误：{e} - {response_text[:200]}）"
+                    return f"（直连 API HTTP 错误：{last_error}）"
             except Exception as e:
                 logger.warning(f"第 {attempt+1} 次请求异常: {type(e).__name__}: {e}")
+                last_error = f"{type(e).__name__}: {e}"
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
                     continue
                 else:
-                    return f"（直连 API 失败：{type(e).__name__} - {e}）"
+                    return f"（直连 API 失败：{last_error}）"
 
-        # 理论上不会走到这里，但为了安全返回一个默认值
         return "（直连 API 多次尝试后仍然失败）"
 
 
