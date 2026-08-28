@@ -281,7 +281,7 @@ class ScreenMonitorPlugin(Star):
                         now = time.time()
                         if self._pending_start_time is not None:
                             # 正在等待启动
-                            if high_load:  # 只要高负载持续，就继续等待，不因屏幕变化而取消
+                            if should_start:  # 改为判断 should_start（进程运行或高负载+屏幕变化）
                                 if now - self._pending_start_time >= self.config.get("process_start_duration", 5):
                                     self._pending_start_time = None
                                     await self._start_recording()
@@ -289,7 +289,7 @@ class ScreenMonitorPlugin(Star):
                                     self._process_absent_since = None
                                     self._potential_event_detected = False
                             else:
-                                # 高负载消失，取消等待
+                                # 条件不满足，取消等待
                                 self._pending_start_time = None
                                 self._potential_event_detected = False
                         else:
@@ -301,7 +301,6 @@ class ScreenMonitorPlugin(Star):
                                     wait_time = self.config.get("process_start_duration", 5)
                                     logger.info(f"检测到潜在事件，等待 {wait_time} 秒后开始记录...")
                             else:
-                                # 条件不满足，重置标记
                                 self._potential_event_detected = False
 
                     # 循环间隔
